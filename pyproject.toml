@@ -11,9 +11,20 @@ dependencies = [
     "numpy>=2.2.4",
     "pydantic>=2.11.3",
     "soundfile>=0.13.1",
-    "torch>=2.6.0",
-    "torchaudio>=2.6.0",
+    "pytorch-triton-rocm",
+    "torch",
+    "torchaudio",
 ]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-rocm" }]
+torchaudio = [{ index = "pytorch-rocm" }]
+pytorch-triton-rocm = [{ index = "pytorch-rocm" }]
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/nightly/rocm6.3"
+explicit = true
 
 [tool.ruff]
 # Never enforce `E501` (line length violations).

@@ -389,6 +389,9 @@ class Attention(nn.Module):
                     new_kv_cache = Xk_BxNxSxH, Xv_BxNxSxH
                     attn_k, attn_v = cache.get_kv_for_attention(Xk_BxNxSxH, Xv_BxNxSxH)
 
+        if Xq_BxNxTxH.dtype != attn_k.dtype:
+            Xq_BxNxTxH = Xq_BxNxTxH.to(dtype=attn_k.dtype)
+
         attn_output = F.scaled_dot_product_attention(
             Xq_BxNxTxH,
             attn_k,
