@@ -22,7 +22,7 @@ parser.add_argument(
     "--device-map", 
     type=str, 
     default="auto", 
-    choices=["auto", "balanced", "cuda", "cpu"],
+    choices=["auto", "balanced", "balanced_low_0", "sequential"],
     help="How to distribute model across devices (default: auto)"
 )
 
