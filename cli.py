@@ -73,6 +73,13 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to run inference on (e.g., 'cuda', 'cpu', default: auto).",
     )
+    infra_group.add_argument(
+        "--device-map",
+        type=str,
+        default="auto",
+        choices=["auto", "balanced", "balanced_low_0", "sequential"],
+        help="How to distribute model across devices (default: auto).",
+    )
 
     args = parser.parse_args()
 
@@ -100,15 +107,17 @@ def main():
     print("Loading model...")
     if args.local_paths:
         print(f"Loading from local paths: config='{args.config}', checkpoint='{args.checkpoint}'")
+        print(f"Device map: {args.device_map}")
         try:
-            model = Dia.from_local(args.config, args.checkpoint, device=device)
+            model = Dia.from_local(args.config, args.checkpoint, device=device, device_map=args.device_map)
         except Exception as e:
             print(f"Error loading local model: {e}")
             exit(1)
     else:
         print(f"Loading from Hugging Face Hub: repo_id='{args.repo_id}'")
+        print(f"Device map: {args.device_map}")
         try:
-            model = Dia.from_pretrained(args.repo_id, device=device)
+            model = Dia.from_pretrained(args.repo_id, device=device, device_map=args.device_map)
         except Exception as e:
             print(f"Error loading model from Hub: {e}")
             exit(1)
