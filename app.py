@@ -18,6 +18,13 @@ parser.add_argument(
     "--device", type=str, default=None, help="Force device (e.g., 'cuda', 'mps', 'cpu')"
 )
 parser.add_argument("--share", action="store_true", help="Enable Gradio sharing")
+parser.add_argument(
+    "--device-map", 
+    type=str, 
+    default="auto", 
+    choices=["auto", "balanced", "balanced_low_0", "sequential"],
+    help="How to distribute model across devices (default: auto)"
+)
 
 args = parser.parse_args()
 
@@ -35,12 +42,13 @@ else:
     device = torch.device("cpu")
 
 print(f"Using device: {device}")
+print(f"Device map: {args.device_map}")
 
 # Load Nari model and config
 print("Loading Nari model...")
 try:
     # Use the function from inference.py
-    model = Dia.from_pretrained("nari-labs/Dia-1.6B", device=device)
+    model = Dia.from_pretrained("nari-labs/Dia-1.6B", device=device, device_map=args.device_map)
 except Exception as e:
     print(f"Error loading Nari model: {e}")
     raise
