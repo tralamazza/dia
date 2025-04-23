@@ -16,13 +16,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cpu = ["torch>=2.6.0", "torchaudio>=2.6.0"]
 cuda = [
     "torch>=2.6.0",
     "torchaudio>=2.6.0",
     "triton>=3.2.0 ; sys_platform == 'linux'",
     "triton-windows>=3.2.0.post18 ; sys_platform == 'win32'",
 ]
-rocm = ["torch", "torchaudio", "pytorch-triton-rocm"]
+rocm = ["torch>=2.6.0", "torchaudio>=2.6.0", "pytorch-triton-rocm"]
 
 [build-system]
 requires = ["hatchling"]
@@ -50,17 +51,24 @@ lines-after-imports = 2
 
 [tool.uv.sources]
 torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu126", extra = "cuda" },
     { index = "pytorch-rocm", extra = "rocm" },
 ]
 torchaudio = [
+    { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu126", extra = "cuda" },
     { index = "pytorch-rocm", extra = "rocm" },
 ]
 pytorch-triton-rocm = [{ index = "pytorch-rocm", extra = "rocm" }]
 
 [tool.uv]
-conflicts = [[{ extra = "cuda" }, { extra = "rocm" }]]
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }, { extra = "rocm" }]]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
@@ -69,5 +77,5 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/nightly/rocm6.3"
+url = "https://download.pytorch.org/whl/rocm6.3"
 explicit = true
