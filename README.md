@@ -40,19 +40,16 @@ This will open a Gradio UI that you can work on.
 
 ```bash
 git clone https://github.com/nari-labs/dia.git
-cd dia && uv run app.py
-```
-
-or if you do not have `uv` pre-installed:
-
-```bash
-git clone https://github.com/nari-labs/dia.git
 cd dia
-python -m venv .venv
+uv venv
 source .venv/bin/activate
-pip install -e .
-python app.py
+uv run --extra rocm app.py # or "--extra cuda" for NVIDIA
 ```
+
+> [!TIP]
+> ROCm too slow? Try using the `MIOPEN_FIND_MODE=FAST` environment variable.
+> `MIOPEN_FIND_MODE=FAST uv run --extra rocm app.py`
+
 
 Note that the model was not fine-tuned on a specific voice. Hence, you will get different voices every time you run the model.
 You can keep speaker consistency by either adding an audio prompt (a guide coming VERY soon - try it with the second example on Gradio for now), or fixing the seed.

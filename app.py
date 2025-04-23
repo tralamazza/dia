@@ -192,6 +192,12 @@ def run_inference(
                 f"Audio conversion successful. Final shape: {output_audio[1].shape}, Sample Rate: {output_sr}"
             )
 
+            if output_audio[1].dtype == np.float32 or output_audio[1].dtype == np.float64:
+                audio_for_gradio = np.clip(output_audio[1], -1.0, 1.0)
+                audio_for_gradio = (audio_for_gradio * 32767).astype(np.int16)
+                output_audio = (output_sr, audio_for_gradio)
+                print("Converted audio to int16 for Gradio output.")
+
         else:
             print("\nGeneration finished, but no valid tokens were produced.")
             # Return default silence

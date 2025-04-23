@@ -4,10 +4,8 @@ version = "0.1.0"
 description = "Dia - A text-to-speech model for dialogue generation"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
-authors = [
-    {name = "Nari Labs", email = "contact@narilabs.ai"}
-]
+license = { file = "LICENSE" }
+authors = [{ name = "Nari Labs", email = "contact@narilabs.ai" }]
 dependencies = [
     "descript-audio-codec>=1.0.0",
     "gradio>=5.25.2",
@@ -15,11 +13,16 @@ dependencies = [
     "numpy>=2.2.4",
     "pydantic>=2.11.3",
     "soundfile>=0.13.1",
+]
+
+[project.optional-dependencies]
+cuda = [
     "torch>=2.6.0",
     "torchaudio>=2.6.0",
     "triton>=3.2.0 ; sys_platform == 'linux'",
     "triton-windows>=3.2.0.post18 ; sys_platform == 'win32'",
 ]
+rocm = ["torch", "torchaudio", "pytorch-triton-rocm"]
 
 [build-system]
 requires = ["hatchling"]
@@ -47,13 +50,24 @@ lines-after-imports = 2
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu126", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm" },
 ]
 torchaudio = [
-  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu126", extra = "cuda" },
+    { index = "pytorch-rocm", extra = "rocm" },
 ]
+pytorch-triton-rocm = [{ index = "pytorch-rocm", extra = "rocm" }]
+
+[tool.uv]
+conflicts = [[{ extra = "cuda" }, { extra = "rocm" }]]
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/nightly/rocm6.3"
 explicit = true
