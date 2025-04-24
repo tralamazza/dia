@@ -1,15 +1,22 @@
+import time
+from enum import Enum
+
 import dac
 import numpy as np
 import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
 
-from .audio import audio_to_codebook, codebook_to_audio
+from .audio import apply_audio_delay, build_delay_indices, build_revert_indices, decode, revert_audio_delay
 from .config import DiaConfig
-from .layers import DiaModel, KVCache
+from .layers import DiaModel
+from .state import DecoderInferenceState, DecoderOutput, EncoderInferenceState
 
 
-def get_default_device():
+DEFAULT_SAMPLE_RATE = 44100
+
+
+def _get_default_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -21,14 +28,13 @@ def _sample_next_token(
     logits_BCxV: torch.Tensor,
     temperature: float,
     top_p: float,
-    use_cfg_filter: bool,
     cfg_filter_top_k: int | None = None,
 ) -> torch.Tensor:
     if temperature == 0.0:
         return torch.argmax(logits_BCxV, dim=-1)
 
     logits_BCxV = logits_BCxV / temperature
-    if use_cfg_filter and cfg_filter_top_k is not None:
+    if cfg_filter_top_k is not None:
         _, top_k_indices_BCxV = torch.topk(logits_BCxV, k=cfg_filter_top_k, dim=-1)
         mask = torch.ones_like(logits_BCxV, dtype=torch.bool)
         mask.scatter_(dim=-1, index=top_k_indices_BCxV, value=False)
@@ -39,11 +45,9 @@ def _sample_next_token(
         sorted_probs_BCxV, sorted_indices_BCxV = torch.sort(probs_BCxV, dim=-1, descending=True)
         cumulative_probs_BCxV = torch.cumsum(sorted_probs_BCxV, dim=-1)
 
-        # Calculate indices to remove based on top_p
         sorted_indices_to_remove_BCxV = cumulative_probs_BCxV > top_p
-        # Shift the mask to the right to keep the first token above the threshold
         sorted_indices_to_remove_BCxV[..., 1:] = sorted_indices_to_remove_BCxV[..., :-1].clone()
-        sorted_indices_to_remove_BCxV[..., 0] = 0  # Always keep the most probable token
+        sorted_indices_to_remove_BCxV[..., 0] = 0
 
         indices_to_remove_BCxV = torch.zeros_like(sorted_indices_to_remove_BCxV)
         indices_to_remove_BCxV.scatter_(dim=-1, index=sorted_indices_BCxV, src=sorted_indices_to_remove_BCxV)
@@ -56,8 +60,30 @@ def _sample_next_token(
     return sampled_indices_C
 
 
+class ComputeDtype(str, Enum):
+    FLOAT32 = "float32"
+    FLOAT16 = "float16"
+    BFLOAT16 = "bfloat16"
+
+    def to_dtype(self) -> torch.dtype:
+        if self == ComputeDtype.FLOAT32:
+            return torch.float32
+        elif self == ComputeDtype.FLOAT16:
+            return torch.float16
+        elif self == ComputeDtype.BFLOAT16:
+            return torch.bfloat16
+        else:
+            raise ValueError(f"Unsupported compute dtype: {self}")
+
+
 class Dia:
-    def __init__(self, config: DiaConfig, device: torch.device | None = None, device_map: str = "auto"):
+    def __init__(
+        self,
+        config: DiaConfig,
+        compute_dtype: str | ComputeDtype = ComputeDtype.FLOAT32,
+        device: torch.device | None = None,
+        device_map: str = "auto",
+    ):
         """Initializes the Dia model.
 
         Args:
@@ -70,13 +96,23 @@ class Dia:
         """
         super().__init__()
         self.config = config
-        self.device = device if device is not None else get_default_device()
-        self.model = DiaModel(config)
+        self.device = device if device is not None else _get_default_device()
+        if isinstance(compute_dtype, str):
+            compute_dtype = ComputeDtype(compute_dtype)
+        self.compute_dtype = compute_dtype.to_dtype()
+        self.model = DiaModel(config, self.compute_dtype)
         self.dac_model = None
         self.device_map = device_map
 
     @classmethod
-    def from_local(cls, config_path: str, checkpoint_path: str, device: torch.device | None = None, device_map: str = "auto") -> "Dia":
+    def from_local(
+        cls,
+        config_path: str,
+        checkpoint_path: str,
+        compute_dtype: str | ComputeDtype = ComputeDtype.FLOAT32,
+        device: torch.device | None = None,
+        device_map: str = "auto",
+    ) -> "Dia":
         """Loads the Dia model from local configuration and checkpoint files.
 
         Args:
@@ -96,7 +132,7 @@ class Dia:
         if config is None:
             raise FileNotFoundError(f"Config file not found at {config_path}")
 
-        dia = cls(config, device, device_map)
+        dia = cls(config, compute_dtype, device, device_map)
 
         try:
             state_dict = torch.load(checkpoint_path, map_location="cpu")
@@ -113,7 +149,11 @@ class Dia:
 
     @classmethod
     def from_pretrained(
-        cls, model_name: str = "nari-labs/Dia-1.6B", device: torch.device | None = None, device_map: str = "auto"
+        cls,
+        model_name: str = "nari-labs/Dia-1.6B",
+        compute_dtype: str | ComputeDtype = ComputeDtype.FLOAT32,
+        device: torch.device | None = None,
+        device_map: str = "auto",
     ) -> "Dia":
         """Loads the Dia model from a Hugging Face Hub repository.
 
@@ -134,7 +174,8 @@ class Dia:
         """
         config_path = hf_hub_download(repo_id=model_name, filename="config.json")
         checkpoint_path = hf_hub_download(repo_id=model_name, filename="dia-v0_1.pth")
-        return cls.from_local(config_path, checkpoint_path, device, device_map)
+
+        return cls.from_local(config_path, checkpoint_path, compute_dtype, device, device_map)
 
     def _load_dac_model(self):
         try:
@@ -144,44 +185,7 @@ class Dia:
             raise RuntimeError("Failed to load DAC model") from e
         self.dac_model = dac_model
 
-    def _create_attn_mask(
-        self,
-        q_padding_mask_1d: torch.Tensor,
-        k_padding_mask_1d: torch.Tensor,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        """
-        Creates the attention mask (self or cross) mimicking JAX segment ID logic.
-        """
-        B1, Tq = q_padding_mask_1d.shape
-        B2, Tk = k_padding_mask_1d.shape
-        assert B1 == B2, "Query and key batch dimensions must match"
-
-        p_mask_q = q_padding_mask_1d.unsqueeze(2)  # Shape [B, Tq, 1]
-        p_mask_k = k_padding_mask_1d.unsqueeze(1)  # Shape [B, 1, Tk]
-
-        # Condition A: Non-padding query attends to non-padding key
-        non_pad_attends_non_pad = p_mask_q & p_mask_k  # Shape [B, Tq, Tk]
-
-        # Condition B: Padding query attends to padding key
-        pad_attends_pad = (~p_mask_q) & (~p_mask_k)  # Shape [B, Tq, Tk]
-
-        # Combine: True if padding status is compatible (both non-pad OR both pad)
-        # This implementation follows Jax TPU splash attention kernel
-        mask = non_pad_attends_non_pad | pad_attends_pad  # Shape [B, Tq, Tk]
-
-        if is_causal:
-            # Ensure causality for self-attention (Tq == Tk)
-            assert Tq == Tk, "Causal mask requires query and key sequence lengths to be equal"
-            # Standard lower-triangular causal mask (True means allow)
-            causal_mask_2d = torch.tril(torch.ones((Tq, Tk), dtype=torch.bool, device=self.device))  # Shape [Tq, Tk]
-            causal_mask = mask & causal_mask_2d  # Shape [B, Tq, Tk]
-            return causal_mask.unsqueeze(1)  # Shape [B, 1, Tq, Tk] for broadcasting across heads
-        else:
-            # For cross-attention or non-causal self-attention
-            return mask.unsqueeze(1)  # Shape [B, 1, Tq, Tk] for broadcasting across heads
-
-    def _prepare_text_input(self, text: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _prepare_text_input(self, text: str) -> torch.Tensor:
         """Encodes text prompt, pads, and creates attention mask and positions."""
         text_pad_value = self.config.data.text_pad_value
         max_len = self.config.data.text_length
@@ -204,13 +208,150 @@ class Dia:
             ).astype(np.uint8)
 
         src_tokens = torch.from_numpy(padded_text_np).to(torch.long).to(self.device).unsqueeze(0)  # [1, S]
-        src_positions = torch.arange(max_len, device=self.device).to(torch.long).unsqueeze(0)  # [1, S]
+        return src_tokens
 
-        src_padding_mask = (src_tokens != text_pad_value).to(self.device)  # [1, S]
+    def _prepare_audio_prompt(self, audio_prompt: torch.Tensor | None) -> tuple[torch.Tensor, int]:
+        num_channels = self.config.data.channels
+        audio_bos_value = self.config.data.audio_bos_value
+        audio_pad_value = self.config.data.audio_pad_value
+        delay_pattern = self.config.data.delay_pattern
+        max_delay_pattern = max(delay_pattern)
 
-        enc_self_attn_mask = self._create_attn_mask(src_padding_mask, src_padding_mask, is_causal=False)  # [1, S, S]
+        prefill = torch.full(
+            (1, num_channels),
+            fill_value=audio_bos_value,
+            dtype=torch.int,
+            device=self.device,
+        )
 
-        return src_tokens, src_positions, src_padding_mask, enc_self_attn_mask
+        prefill_step = 1
+
+        if audio_prompt is not None:
+            prefill_step += audio_prompt.shape[0]
+            prefill = torch.cat([prefill, audio_prompt], dim=0)
+
+        delay_pad_tensor = torch.full(
+            (max_delay_pattern, num_channels), fill_value=-1, dtype=torch.int, device=self.device
+        )
+        prefill = torch.cat([prefill, delay_pad_tensor], dim=0)
+
+        delay_precomp = build_delay_indices(
+            B=1,
+            T=prefill.shape[0],
+            C=num_channels,
+            delay_pattern=delay_pattern,
+        )
+
+        prefill = apply_audio_delay(
+            audio_BxTxC=prefill.unsqueeze(0),
+            pad_value=audio_pad_value,
+            bos_value=audio_bos_value,
+            precomp=delay_precomp,
+        ).squeeze(0)
+
+        return prefill, prefill_step
+
+    def _prepare_generation(self, text: str, audio_prompt: str | torch.Tensor | None, verbose: bool):
+        enc_input_cond = self._prepare_text_input(text)
+        enc_input_uncond = torch.zeros_like(enc_input_cond)
+        enc_input = torch.cat([enc_input_uncond, enc_input_cond], dim=0)
+
+        if isinstance(audio_prompt, str):
+            audio_prompt = self.load_audio(audio_prompt)
+        prefill, prefill_step = self._prepare_audio_prompt(audio_prompt)
+
+        if verbose:
+            print("generate: data loaded")
+
+        enc_state = EncoderInferenceState.new(self.config, enc_input_cond)
+        encoder_out = self.model.encoder(enc_input, enc_state)
+
+        dec_cross_attn_cache = self.model.decoder.precompute_cross_attn_cache(encoder_out, enc_state.positions)
+        dec_state = DecoderInferenceState.new(
+            self.config, enc_state, encoder_out, dec_cross_attn_cache, self.compute_dtype
+        )
+        dec_output = DecoderOutput.new(self.config, self.device)
+        dec_output.prefill(prefill, prefill_step)
+
+        dec_step = prefill_step - 1
+        if dec_step > 0:
+            dec_state.prepare_step(0, dec_step)
+            tokens_BxTxC = dec_output.get_tokens_at(0, dec_step).unsqueeze(0).expand(2, -1, -1)
+            self.model.decoder.forward(tokens_BxTxC, dec_state)
+
+        return dec_state, dec_output
+
+    def _decoder_step(
+        self,
+        tokens_Bx1xC: torch.Tensor,
+        dec_state: DecoderInferenceState,
+        cfg_scale: float,
+        temperature: float,
+        top_p: float,
+        cfg_filter_top_k: int,
+    ) -> torch.Tensor:
+        audio_eos_value = self.config.data.audio_eos_value
+        logits_Bx1xCxV = self.model.decoder.decode_step(tokens_Bx1xC, dec_state)
+
+        logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]
+        uncond_logits_CxV = logits_last_BxCxV[0, :, :]
+        cond_logits_CxV = logits_last_BxCxV[1, :, :]
+
+        logits_CxV = cond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
+        logits_CxV[:, audio_eos_value + 1 :] = -torch.inf
+        logits_CxV[1:, audio_eos_value:] = -torch.inf
+
+        pred_C = _sample_next_token(
+            logits_CxV.float(),
+            temperature=temperature,
+            top_p=top_p,
+            cfg_filter_top_k=cfg_filter_top_k,
+        )
+        return pred_C
+
+    def _generate_output(self, generated_codes: torch.Tensor) -> np.ndarray:
+        num_channels = self.config.data.channels
+        seq_length = generated_codes.shape[0]
+        delay_pattern = self.config.data.delay_pattern
+        audio_pad_value = self.config.data.audio_pad_value
+        max_delay_pattern = max(delay_pattern)
+
+        revert_precomp = build_revert_indices(
+            B=1,
+            T=seq_length,
+            C=num_channels,
+            delay_pattern=delay_pattern,
+        )
+
+        codebook = revert_audio_delay(
+            audio_BxTxC=generated_codes.unsqueeze(0),
+            pad_value=audio_pad_value,
+            precomp=revert_precomp,
+            T=seq_length,
+        )[:, :-max_delay_pattern, :]
+
+        min_valid_index = 0
+        max_valid_index = 1023
+        invalid_mask = (codebook < min_valid_index) | (codebook > max_valid_index)
+        codebook[invalid_mask] = 0
+
+        audio = decode(self.dac_model, codebook.transpose(1, 2))
+
+        return audio.squeeze().cpu().numpy()
+
+    def load_audio(self, audio_path: str) -> torch.Tensor:
+        audio, sr = torchaudio.load(audio_path, channels_first=True)  # C, T
+        if sr != DEFAULT_SAMPLE_RATE:
+            audio = torchaudio.functional.resample(audio, sr, DEFAULT_SAMPLE_RATE)
+        audio = audio.to(self.device).unsqueeze(0)  # 1, C, T
+        audio_data = self.dac_model.preprocess(audio, DEFAULT_SAMPLE_RATE)
+        _, encoded_frame, _, _, _ = self.dac_model.encode(audio_data)  # 1, C, T
+        return encoded_frame.squeeze(0).transpose(0, 1)
+
+    def save_audio(self, path: str, audio: np.ndarray):
+        import soundfile as sf
+
+        sf.write(path, audio, DEFAULT_SAMPLE_RATE)
 
     @torch.inference_mode()
     def generate(
@@ -220,225 +361,87 @@ class Dia:
         cfg_scale: float = 3.0,
         temperature: float = 1.3,
         top_p: float = 0.95,
-        use_cfg_filter: bool = True,
         use_torch_compile: bool = False,
         cfg_filter_top_k: int = 35,
-        audio_prompt_path: str | None = None,
+        audio_prompt: str | torch.Tensor | None = None,
+        verbose: bool = False,
     ) -> np.ndarray:
-        """
-        Generates audio from a text prompt (and optional audio prompt) using the Nari model.
-
-        Returns:
-            A tensor of generated audio codes (shape: [max_tokens, num_channels]).
-        """
-        num_channels = self.config.data.channels
-        audio_bos_value = self.config.data.audio_bos_value
         audio_eos_value = self.config.data.audio_eos_value
         audio_pad_value = self.config.data.audio_pad_value
         delay_pattern = self.config.data.delay_pattern
         max_tokens = self.config.data.audio_length if max_tokens is None else max_tokens
-        delay_tensor = torch.tensor(delay_pattern, dtype=torch.long, device=self.device)
         max_delay_pattern = max(delay_pattern)
         self.model.eval()
 
-        (
-            cond_src_BxS,
-            cond_src_positions_BxS,
-            cond_src_padding_mask_BxS,
-            cond_enc_self_attn_mask_Bx1xSxS,
-        ) = self._prepare_text_input(text)
+        if verbose:
+            total_start_time = time.time()
 
-        unc_src_BxS = torch.zeros_like(cond_src_BxS)
-        src_BxS = torch.cat([unc_src_BxS, cond_src_BxS], dim=0)
-        src_positions_BxS = cond_src_positions_BxS.expand(2, -1)
-        src_padding_mask_BxS = cond_src_padding_mask_BxS.expand(2, -1)
-        enc_self_attn_mask_Bx1xSxS = cond_enc_self_attn_mask_Bx1xSxS.expand(2, -1, -1, -1)
+        dec_state, dec_output = self._prepare_generation(text, audio_prompt, verbose)
+        dec_step = dec_output.prefill_step - 1
 
-        # 2. Encoder Pass
-        # with torch.autocast(device_type="cuda", dtype=forward_dtype):
-        encoder_out = self.model.encoder(
-            x_ids=src_BxS,
-            src_positions=src_positions_BxS,
-            deterministic=True,
-            attn_mask=enc_self_attn_mask_Bx1xSxS,
-        )  # Shape: (B, S, E)
-
-        # 3. Prepare Decoder Inputs
-        # 3-1. Allocate KV Cache (Static)
-        decoder_cross_attention_cache: list[KVCache] = self.model.decoder.precompute_cross_attention_kv(
-            max_tokens, encoder_out, src_positions_BxS
-        )
-
-        decoder_self_attention_cache: list[KVCache] = []
-        for _ in range(self.model.decoder.num_layers):
-            decoder_self_attention_cache.append(
-                KVCache(
-                    self.config.model.decoder.gqa_query_heads,
-                    max_tokens,
-                    self.config.model.decoder.gqa_head_dim,
-                    self.device,
-                )
-            )
-
-        # 3-2. Initialize Decoder Inputs
-        generated_BxTxC = torch.full(
-            (2, 1, num_channels),
-            fill_value=audio_bos_value,
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        current_step = 0
-        prompt_len_inc_bos = 1  # Start with BOS length
-
-        # 3-3. Load Audio Prompt (if provided)
-        if audio_prompt_path is not None:
-            audio_prompt, sr = torchaudio.load(audio_prompt_path, channels_first=True)  # C, T
-            if sr != 44100:  # Resample to 44.1kHz
-                audio_prompt = torchaudio.functional.resample(audio_prompt, sr, 44100)
-            audio_prompt = audio_prompt.to(self.device).unsqueeze(0)  # 1, C, T
-            audio_prompt = audio_to_codebook(self.dac_model, audio_prompt, data_config=self.config.data)
-            generated_BxTxC = torch.cat([generated_BxTxC, audio_prompt.expand(2, -1, -1)], dim=1)
-
-            prefill_len = generated_BxTxC.shape[1]
-            prompt_len_inc_bos = prefill_len
-            prefill_tgt_pos = torch.arange(prefill_len, device=self.device).unsqueeze(0).expand(2, -1)
-            prefill_tgt_padding_mask = (generated_BxTxC != audio_pad_value).any(dim=2)
-
-            prefill_self_attn_mask = self._create_attn_mask(
-                prefill_tgt_padding_mask,
-                prefill_tgt_padding_mask,
-                is_causal=True,
-            )
-            prefill_cross_attn_mask = self._create_attn_mask(
-                prefill_tgt_padding_mask,
-                src_padding_mask_BxS,
-                is_causal=False,
-            )
-
-            _ = self.model.decoder.forward(
-                tgt_ids_BxTxC=generated_BxTxC,
-                encoder_out=encoder_out,
-                tgt_positions=prefill_tgt_pos,
-                src_positions=src_positions_BxS,
-                deterministic=True,
-                self_attn_mask=prefill_self_attn_mask,
-                cross_attn_mask=prefill_cross_attn_mask,
-                self_attention_cache=decoder_self_attention_cache,
-                cross_attention_cache=decoder_cross_attention_cache,
-            )
-
-            current_step = prefill_len - 1
-
-        # 4. Autoregressive Generation Loop
-        eos_detected_channel_0 = False
+        bos_countdown = max_delay_pattern
+        eos_detected = False
         eos_countdown = -1
-        extra_steps_after_eos = 30
-        # Make generated_BxTxC a fixed size tensor
-        # Length is either 1 + max tokens or 1 + prompt len + max tokens
-        generated_BxTxC = torch.cat(
-            [
-                generated_BxTxC,
-                torch.full(
-                    (2, max_tokens, num_channels),
-                    fill_value=-1,
-                    dtype=torch.long,
-                    device=self.device,
-                ),
-            ],
-            dim=1,
-        )
 
-        decode_step = self.model.decoder.decode_step
         if use_torch_compile:
-            decode_step = torch.compile(
-                self.model.decoder.decode_step,
-                mode="default",
+            step_fn = torch.compile(self._decoder_step, mode="default")
+        else:
+            step_fn = self._decoder_step
+
+        if verbose:
+            print("generate: starting generation loop")
+            if use_torch_compile:
+                print("generate: by using use_torch_compile=True, the first step would take long")
+            start_time = time.time()
+
+        while dec_step < max_tokens:
+            dec_state.prepare_step(dec_step)
+            tokens_Bx1xC = dec_output.get_tokens_at(dec_step).unsqueeze(0).expand(2, -1, -1)
+            pred_C = step_fn(
+                tokens_Bx1xC,
+                dec_state,
+                cfg_scale,
+                temperature,
+                top_p,
+                cfg_filter_top_k,
             )
 
-        tgt_padding_mask = (
-            (generated_BxTxC[:, -1, :].unsqueeze(1) != audio_pad_value).any(dim=2).to(self.device)
-        )  # [B, 1]
-        # Generated tokens are never PAD, so we use fixed mask
-        decoder_cross_attn_mask = self._create_attn_mask(
-            tgt_padding_mask,  # Query mask [B, 1]
-            src_padding_mask_BxS,  # Key mask [B, S]
-            is_causal=False,
-        )  # [B, 1, 1, S]
-
-        for step in range(current_step, current_step + max_tokens):
-            tgt_ids_Bx1xC = generated_BxTxC[:, step, :].unsqueeze(1)
-            tgt_pos_Bx1 = torch.full(
-                (2, 1),
-                fill_value=step,
-                dtype=torch.long,
-                device=self.device,
-            )
-
-            logits_Bx1xCxV, new_cache = decode_step(
-                tgt_ids_Bx1xC=tgt_ids_Bx1xC,
-                tgt_pos_Bx1=tgt_pos_Bx1,
-                encoder_out=encoder_out,
-                self_attn_mask=None,
-                cross_attn_mask=decoder_cross_attn_mask,
-                self_attention_cache=decoder_self_attention_cache,
-                cross_attention_cache=decoder_cross_attention_cache,
-            )
-
-            for i, layer_cache in enumerate(decoder_self_attention_cache):
-                layer_cache.update_cache(new_cache[i][0], new_cache[i][1])
-
-            V = self.config.model.tgt_vocab_size
-            logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]  # B, C, V
-            uncond_logits_CxV = logits_last_BxCxV[0, :, :]
-            cond_logits_CxV = logits_last_BxCxV[1, :, :]
-
-            cfg_logits_CxV = cond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
-
-            logits_CxV = cfg_logits_CxV.reshape((-1, V))  # C, V
-            logits_CxV[:, 1025:] = -torch.inf
-
-            # Sample next token
-            pred_C = _sample_next_token(
-                logits_CxV.float(),
-                temperature=temperature,
-                top_p=top_p,
-                use_cfg_filter=use_cfg_filter,
-                cfg_filter_top_k=cfg_filter_top_k,
-            )
-
-            generation_step_index = step - current_step
-            if audio_prompt_path is None:
-                pred_C = torch.where(
-                    generation_step_index >= delay_tensor,
-                    pred_C,
-                    audio_bos_value,
-                )
-
-            generated_BxTxC[:, step + 1, :] = pred_C.unsqueeze(0).expand(2, -1)
-
-            if not eos_detected_channel_0 and pred_C[0] == audio_eos_value:
-                eos_detected_channel_0 = True
-                eos_countdown = extra_steps_after_eos
+            if (not eos_detected and pred_C[0] == audio_eos_value) or dec_step == max_tokens - max_delay_pattern - 1:
+                eos_detected = True
+                eos_countdown = max_delay_pattern
 
             if eos_countdown > 0:
                 step_after_eos = max_delay_pattern - eos_countdown
                 for i, d in enumerate(delay_pattern):
                     if step_after_eos == d:
-                        generated_BxTxC[:, step + 1, i] = audio_eos_value
+                        pred_C[i] = audio_eos_value
                     elif step_after_eos > d:
-                        generated_BxTxC[:, step + 1, i] = audio_pad_value
+                        pred_C[i] = audio_pad_value
                 eos_countdown -= 1
-                if eos_countdown == 0:
-                    break
 
-            generation_step_index = step - current_step + 1
+            bos_countdown = max(0, bos_countdown - 1)
+            dec_output.update_one(pred_C, dec_step + 1, bos_countdown > 0)
 
-        output_codes = generated_BxTxC[:, prompt_len_inc_bos : step + 1, :]
+            if eos_countdown == 0:
+                break
 
-        generated_codes = output_codes[0]
+            dec_step += 1
+            if verbose and dec_step % 86 == 0:
+                duration = time.time() - start_time
+                print(
+                    f"generate step {dec_step}: speed={86 / duration:.3f} tokens/s, realtime factor={1 / duration:.3f}x"
+                )
+                start_time = time.time()
 
-        audio = codebook_to_audio(
-            generated_codes.transpose(1, 0), self.dac_model, delay_pattern, B=1, T=max_tokens, C=num_channels
-        )
-        return audio.squeeze().cpu().numpy()
+        if dec_output.prefill_step >= dec_step + 1:
+            print("Warning: Nothing generated")
+            return None
+
+        generated_codes = dec_output.generated_tokens[dec_output.prefill_step : dec_step + 1, :]
+
+        if verbose:
+            total_step = dec_step + 1 - dec_output.prefill_step
+            total_duration = time.time() - total_start_time
+            print(f"generate: total step={total_step}, total duration={total_duration:.3f}s")
+
+        return self._generate_output(generated_codes)

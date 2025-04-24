@@ -67,8 +67,6 @@ class EncoderConfig(BaseModel, frozen=True):
         n_hidden: Hidden dimension size in the MLP layers.
         n_head: Number of attention heads.
         head_dim: Dimension per attention head.
-        mlp_activations: List of activation functions for the MLP layers.
-        use_pre_norm: Whether to use pre-normalization (LayerNorm before attention/MLP).
     """
 
     n_layer: int = Field(gt=0)
@@ -76,8 +74,6 @@ class EncoderConfig(BaseModel, frozen=True):
     n_hidden: int = Field(gt=0)
     n_head: int = Field(gt=0)
     head_dim: int = Field(gt=0)
-    mlp_activations: list[str] = Field(default=["silu", "linear"])
-    use_pre_norm: bool = Field(default=False)
 
 
 class DecoderConfig(BaseModel, frozen=True):
@@ -92,8 +88,6 @@ class DecoderConfig(BaseModel, frozen=True):
         gqa_head_dim: Dimension per query head for grouped-query self-attention.
         cross_query_heads: Number of query heads for cross-attention.
         cross_head_dim: Dimension per cross-attention head.
-        mlp_activations: List of activation functions for the MLP layers.
-        use_pre_norm: Whether to use pre-normalization.
     """
 
     n_layer: int = Field(gt=0)
@@ -104,8 +98,6 @@ class DecoderConfig(BaseModel, frozen=True):
     gqa_head_dim: int = Field(gt=0)
     cross_query_heads: int = Field(gt=0)
     cross_head_dim: int = Field(gt=0)
-    mlp_activations: list[str] = Field(default=["silu", "linear"])
-    use_pre_norm: bool = Field(default=False)
 
 
 class ModelConfig(BaseModel, frozen=True):
@@ -135,19 +127,7 @@ class ModelConfig(BaseModel, frozen=True):
 
 
 class TrainingConfig(BaseModel, frozen=True):
-    """Training process configuration and hyperparameters.
-
-    Note: This configuration currently only includes precision settings.
-    Other training parameters (like batch size, learning rate, optimizer settings)
-    are assumed to be handled externally.
-
-    Attributes:
-        dtype: Data type for activations during training (e.g., "bfloat16", "float32").
-        logits_dot_in_fp32: Whether to compute the final logits dot product in fp32 for stability.
-    """
-
-    dtype: str = Field(default="bfloat16", description="Activation precision")
-    logits_dot_in_fp32: bool = Field(default=False)
+    pass
 
 
 class DiaConfig(BaseModel, frozen=True):
@@ -164,6 +144,7 @@ class DiaConfig(BaseModel, frozen=True):
 
     version: str = Field(default="1.0")
     model: ModelConfig
+    # TODO: remove training. this is just for backwards-compatability
     training: TrainingConfig
     data: DataConfig
 

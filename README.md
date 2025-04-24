@@ -93,7 +93,7 @@ On enterprise GPUs, Dia can generate audio in real-time. On older GPUs, inferenc
 For reference, on a A4000 GPU, Dia roughly generates 40 tokens/s (86 tokens equals 1 second of audio).
 `torch.compile` will increase speeds for supported GPUs.
 
-The full version of Dia requires around 10GB of VRAM to run. We will be adding a quantized version in the future.
+The full version of Dia requires around 12-13GB of VRAM to run. We will be adding a quantized version in the future.
 
 If you don't have hardware available or if you want to play with bigger versions of our models, join the waitlist [here](https://tally.so/r/meokbo).
 
@@ -126,7 +126,7 @@ Join our [Discord Server](https://discord.gg/pgdB5YRe) for discussions.
 
 - We thank the [Google TPU Research Cloud program](https://sites.research.google/trc/about/) for providing computation resources.
 - Our work was heavily inspired by [SoundStorm](https://arxiv.org/abs/2305.09636), [Parakeet](https://jordandarefsky.com/blog/2024/parakeet/), and [Descript Audio Codec](https://github.com/descriptinc/descript-audio-codec).
-- HuggingFace for providing the ZeroGPU Grant.
+- Hugging Face for providing the ZeroGPU Grant.
 - "Nari" is a pure Korean word for lily.
 - We thank Jason Y. for providing help with data filtering.
 
