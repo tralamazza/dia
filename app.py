@@ -141,10 +141,9 @@ def run_inference(
                 cfg_scale=cfg_scale,
                 temperature=temperature,
                 top_p=top_p,
-                use_cfg_filter=True,
                 cfg_filter_top_k=cfg_filter_top_k,  # Pass the value here
                 use_torch_compile=False,  # Keep False for Gradio stability
-                audio_prompt_path=prompt_path_for_generate,
+                audio_prompt=prompt_path_for_generate,
             )
 
         end_time = time.time()
